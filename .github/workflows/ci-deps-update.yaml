@@ -1,0 +1,123 @@
+name: CI Dependency Update
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ci-deps-update
+  cancel-in-progress: true
+
+jobs:
+  update-ci-deps:
+    name: Update pinned Lua and StyLua versions in mise.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check latest upstream releases and update mise.toml
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import tomllib
+          import urllib.request
+
+          ua = "cordis-lua-ci-deps-update"
+          mise_path = pathlib.Path("mise.toml")
+          mise_text = mise_path.read_text(encoding="utf-8")
+          tools = tomllib.loads(mise_text)["tools"]
+          updated = mise_text
+
+          # 1. Check latest Lua release on lua.org/ftp/.
+          req = urllib.request.Request("https://www.lua.org/ftp/", headers={"User-Agent": ua})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              index_html = resp.read().decode("utf-8", errors="replace")
+          versions = sorted(
+              {
+                  tuple(int(part) for part in m.groups())
+                  for m in re.finditer(r"lua-(\d+)\.(\d+)\.(\d+)\.tar\.gz", index_html)
+              }
+          )
+          if versions:
+              latest_lua = ".".join(str(p) for p in versions[-1])
+              if latest_lua != tools["lua"]:
+                  tar_url = f"https://www.lua.org/ftp/lua-{latest_lua}.tar.gz"
+                  tar_req = urllib.request.Request(tar_url, headers={"User-Agent": ua})
+                  with urllib.request.urlopen(tar_req, timeout=60) as resp:
+                      digest = hashlib.sha256(resp.read()).hexdigest()
+                  updated = re.sub(
+                      r'(?m)^lua\s*=\s*"[^"]+"(?:\s*#.*)?$',
+                      f'lua = "{latest_lua}" # sha256: {digest}',
+                      updated,
+                  )
+                  print(f"Updated lua -> {latest_lua} ({digest})")
+
+          # 2. Check latest StyLua release.
+          gh_headers = {"Accept": "application/vnd.github+json", "User-Agent": ua}
+          token = os.environ.get("GH_TOKEN")
+          if token:
+              gh_headers["Authorization"] = f"Bearer {token}"
+          st_req = urllib.request.Request(
+              "https://api.github.com/repos/JohnnyMorganz/StyLua/releases/latest",
+              headers=gh_headers,
+          )
+          with urllib.request.urlopen(st_req, timeout=30) as resp:
+              st_rel = json.loads(resp.read().decode("utf-8"))
+          if not st_rel.get("draft") and not st_rel.get("prerelease"):
+              ver = str(st_rel.get("tag_name", "")).lstrip("v").strip()
+              if re.fullmatch(r"\d+\.\d+\.\d+", ver) and ver != tools["stylua"]:
+                  updated = re.sub(
+                      r'(?m)^stylua\s*=\s*"[^"]+"$',
+                      f'stylua = "{ver}"',
+                      updated,
+                  )
+                  print(f"Updated stylua -> {ver}")
+
+          if updated != mise_text:
+              mise_path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Validate CI policy
+        run: python3 test/ci_policy.py
+
+      - name: Check for mise.toml changes
+        id: diff
+        run: |
+          if git diff --quiet -- mise.toml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          branch: chore/update-ci-versions
+          delete-branch: true
+          commit-message: "chore(ci): update pinned tool versions in mise.toml"
+          title: "chore(ci): update pinned tool versions in mise.toml"
+          body: |
+            Automated update of `mise.toml` from upstream releases.
+
+            This PR was created by `.github/workflows/ci-deps-update.yaml`.
+          labels: |
+            dependencies
+            ci

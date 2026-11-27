@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Load pinned tool versions from mise.toml
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+          text = pathlib.Path("mise.toml").read_text(encoding="utf-8")
+          tools = tomllib.loads(text)["tools"]
+          lua_ver = tools["lua"]
+          stylua_ver = tools["stylua"]
+          m = re.search(r'(?m)^lua\s*=\s*"[^"]+"\s*#\s*sha256:\s*([0-9a-f]{64})\s*$', text)
+          assert m, "mise.toml lua entry must declare '# sha256: <64-hex>'"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"lua_version={lua_ver}\n")
+              fh.write(f"lua_sha256={m.group(1)}\n")
+              fh.write(f"stylua_version={stylua_ver}\n")
+          PY
+
+      - name: Build Lua from source
+        shell: bash
+        env:
+          LUA_VER: ${{ steps.tools.outputs.lua_version }}
+          LUA_SHA: ${{ steps.tools.outputs.lua_sha256 }}
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://www.lua.org/ftp/lua-${LUA_VER}.tar.gz"
+          printf '%s  lua-%s.tar.gz\n' "${LUA_SHA}" "${LUA_VER}" | sha256sum -c -
+          tar xzf "lua-${LUA_VER}.tar.gz"
+          make -C "lua-${LUA_VER}" linux -j"$(nproc)"
+          echo "$PWD/lua-${LUA_VER}/src" >> "$GITHUB_PATH"
+
+      - name: CI policy check
+        run: python3 test/ci_policy.py
+
+      - name: Test (deferred spawn)
+        run: lua test/run.lua
+
+      - name: Test (eager spawn)
+        run: lua test/run.lua --eager
+
+      - name: Test (deferred spawn + contexts)
+        run: lua test/run.lua --contexts
+
+      - name: Test (eager spawn + contexts)
+        run: lua test/run.lua --eager --contexts
+
+      - name: Syntax check
+        run: find lua test -name '*.lua' -print0 | xargs -0 -n1 luac -p
+
+      - name: Install stylua
+        shell: bash
+        env:
+          STYLUA_VER: ${{ steps.tools.outputs.stylua_version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o stylua.zip \
+            "https://github.com/JohnnyMorganz/StyLua/releases/download/v${STYLUA_VER}/stylua-linux-x86_64.zip"
+          mkdir -p "$HOME/.local/bin"
+          unzip -q stylua.zip -d "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Format check
+        run: stylua --check lua test
+
+      - name: Port status check
+        run: lua test/kit/port_check.lua
