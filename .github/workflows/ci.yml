@@ -5,13 +5,102 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Classify changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import fnmatch
+          import os
+          import subprocess
+
+          ZERO_SHA = "0" * 40
+          IMAGE_EXTS = (".png", ".svg", ".gif", ".webp", ".jpg", ".jpeg", ".ico", ".mp4", ".cast")
+
+          def git(*args: str) -> subprocess.CompletedProcess[str]:
+              return subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+
+          def emit(val: bool, reason: str) -> None:
+              print(f"cordis-changes: {reason} -> code={val}")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as fh:
+                      fh.write(f"code={'true' if val else 'false'}\n")
+
+          def changed_files(base: str) -> list[str] | None:
+              if git("cat-file", "-e", f"{base}^{{commit}}").returncode != 0:
+                  if git("fetch", "--no-tags", "--depth=1", "origin", base).returncode != 0:
+                      return None
+              res = git("diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--")
+              if res.returncode != 0:
+                  return None
+              return [p for p in res.stdout.split("\0") if p]
+
+          def is_docs_only(path: str) -> bool:
+              return (
+                  path.startswith("docs/")
+                  or fnmatch.fnmatch(path, "README*.md")
+                  or path.lower().endswith(IMAGE_EXTS)
+                  or path in (
+                      "CHANGELOG.md",
+                      "LICENSE",
+                      "SECURITY.md",
+                      ".gitignore",
+                      "release-please-config.json",
+                      ".release-please-manifest.json",
+                  )
+              )
+
+          event = os.environ.get("EVENT_NAME", "")
+          if event == "workflow_dispatch":
+              emit(True, "workflow_dispatch runs full CI")
+          elif event == "pull_request":
+              if git("rev-parse", "--verify", "HEAD^2").returncode == 0:
+                  files = changed_files("HEAD^1")
+              else:
+                  base = os.environ.get("PR_BASE_SHA", "")
+                  files = changed_files(base) if base else None
+              emit(True if not files else any(not is_docs_only(p) for p in files), "pull_request")
+          elif event == "push":
+              before = os.environ.get("PUSH_BEFORE_SHA", "")
+              has_parent = git("rev-parse", "--verify", "HEAD^1").returncode == 0
+              if not has_parent or not before or before == ZERO_SHA:
+                  emit(True, "orphan or initial push")
+              else:
+                  files = changed_files(before)
+                  emit(True if not files else any(not is_docs_only(p) for p in files), "push")
+          else:
+              emit(True, f"event {event!r}")
+          PY
+
+  test:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
